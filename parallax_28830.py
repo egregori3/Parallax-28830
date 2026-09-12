@@ -11,6 +11,7 @@ class Parallax28830:
     CHANNEL_COUNT = 16
     MIN_PULSE = 1
     MAX_PULSE = 1024
+    MIN_SPEED = 0
     MAX_SPEED = 63
 
     def __init__(
@@ -39,8 +40,8 @@ class Parallax28830:
 
     def set_speed(self, channel: int, speed: int) -> None:
         self._check_channel(channel)
-        if not 0 <= speed <= self.MAX_SPEED:
-            raise ValueError(f"speed must be in range 0-{self.MAX_SPEED}")
+        if not self.MIN_SPEED <= speed <= self.MAX_SPEED:
+            raise ValueError(f"speed must be in range {self.MIN_SPEED}-{self.MAX_SPEED}")
         self._speed[channel] = speed
 
     def set_position(self, channel: int, pulse: int) -> None:
@@ -53,10 +54,23 @@ class Parallax28830:
         self._write(b"!SC" + bytes([channel, self._speed[channel], low, high]) + b"\r")
 
     def get_position(self, channel: int) -> int:
+        """Read current pulse width for a channel."""
         self._check_channel(channel)
         self._write(b"!SCRSP" + bytes([channel]) + b"\r")
         response = self._read_exact(3)
-        return (response[1] << 8) | response[2]
+        read_channel, first, second = response
+        if read_channel != channel:
+            raise RuntimeError(f"response channel mismatch: expected {channel}, got {read_channel}")
+
+        # Position writes use low-byte then high-byte. Prefer that ordering for reads,
+        # but accept the alternate ordering when it is the only valid pulse value.
+        high_first = (first << 8) | second
+        low_first = (second << 8) | first
+        if self.MIN_PULSE <= low_first <= self.MAX_PULSE:
+            return low_first
+        if self.MIN_PULSE <= high_first <= self.MAX_PULSE:
+            return high_first
+        raise RuntimeError(f"invalid pulse value in response: {response!r}")
 
     def disable(self, channel: int) -> None:
         self._check_channel(channel)
@@ -75,19 +89,26 @@ class Parallax28830:
         high = (pulse >> 8) & 0xFF
         self._write(b"!SCD" + bytes([channel, low, high]) + b"\r")
 
-    def set_startup_mode(self, mode: int) -> bytes:
+    def set_startup_mode(self, mode: int) -> int:
+        """Set startup mode and validate 3-byte protocol ACK (DL/PM/BR + mode byte)."""
         if mode not in (0, 1):
             raise ValueError("mode must be 0 (center) or 1 (EEPROM defaults)")
         self._write(b"!SCEDD" + bytes([mode]) + b"\r")
-        return self._read_exact(3)
+        response = self._read_exact(3)
+        # Startup mode acknowledgements observed as: b"DL", b"PM", or b"BR" + mode byte.
+        if response[:2] not in (b"DL", b"PM", b"BR"):
+            raise RuntimeError(f"unexpected startup mode response: {response!r}")
+        if response[2] != mode:
+            raise RuntimeError(f"startup mode mismatch: expected {mode}, got {response[2]}")
+        return response[2]
 
     def get_version(self) -> str:
         self._write(b"!SCVER?\r")
-        return self._read_exact(3).decode("ascii")
+        return self._read_text_response(default_length=3)
 
     def clear_eeprom(self) -> str:
         self._write(b"!SCLEAR\r")
-        return self._read_exact(3).decode("ascii")
+        return self._read_text_response(default_length=3)
 
     def _check_channel(self, channel: int) -> None:
         if not 0 <= channel < self.CHANNEL_COUNT:
@@ -101,3 +122,10 @@ class Parallax28830:
         if len(data) != length:
             raise RuntimeError(f"expected {length} bytes, got {len(data)}")
         return data
+
+    def _read_text_response(self, default_length: int) -> str:
+        if hasattr(self._transport, "read_until"):
+            data = self._transport.read_until(b"\r")
+            if data:
+                return data.rstrip(b"\r").decode("ascii")
+        return self._read_exact(default_length).decode("ascii")
